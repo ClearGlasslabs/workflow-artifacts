@@ -33,7 +33,7 @@ def call(method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
             "Authorization": f"Bearer {TOKEN}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "clearglass-auto-heal/1.0",
+            "User-Agent": "clearglass-auto-heal/1.1",
         },
     )
     with urllib.request.urlopen(req, timeout=45) as r:
@@ -59,6 +59,7 @@ def sig(text: str) -> str:
     hot = [x for x in lines if re.search(r"error|failed|failure|exception|fatal|timed out|cancel|invalid|cannot", x, re.I)]
     s = hot[-1] if hot else (lines[-1] if lines else "unknown failure")
     s = re.sub(r"\b[0-9a-f]{40}\b", "<sha>", s, flags=re.I)
+    s = re.sub(r"\d{4}-\d{2}-\d{2}T\S+", "<timestamp>", s)
     return s[:300]
 
 def classifiers(patterns: dict[str, Any]) -> list[tuple[re.Pattern[str], dict[str, Any]]]:
@@ -72,6 +73,26 @@ def classify(text: str, rules: list[tuple[re.Pattern[str], dict[str, Any]]]) -> 
     for rx, item in rules:
         if rx.search(text): return item.get("category", "UNKNOWN_FAILURE"), item.get("strategy", "Escalate.")
     return "UNKNOWN_FAILURE", "No trusted deterministic repair matched; preserve diagnostics and require review."
+
+def learn_unknown(patterns: dict[str, Any], diagnostics: list[dict[str, Any]]) -> int:
+    added = 0
+    existing = {item.get("pattern") for item in patterns.get("patterns", [])}
+    for diag in diagnostics:
+        signature = str(diag.get("signature", "")).strip()
+        if not signature or signature == "unknown failure":
+            continue
+        literal = re.escape(signature[:160])
+        if literal in existing:
+            continue
+        patterns.setdefault("patterns", []).append({
+            "pattern": literal,
+            "category": "UNKNOWN_FAILURE",
+            "strategy": "Recurring unknown signature; preserve diagnostics and require human review.",
+            "learned_at": utc(),
+        })
+        existing.add(literal)
+        added += 1
+    return added
 
 def ensure_labels() -> None:
     for name, color in {"auto-heal":"1f6feb","bot":"6f42c1","ci":"0e8a16","tests":"5319e7","deps":"0366d6"}.items():
@@ -152,6 +173,7 @@ def main() -> int:
     ensure_labels()
     doctor = False
     processed = 0
+    learned = 0
     for run in runs(limit):
         if processed >= max_cycle: break
         rid, attempt = int(run["id"]), int(run.get("run_attempt") or 1)
@@ -167,6 +189,8 @@ def main() -> int:
         else:
             number = issue(run,cat,strategy,diags)
             action, outcome = ("escalated_issue" if number else "escalated_existing_issue"), "pending_review"
+        if cat == "UNKNOWN_FAILURE":
+            learned += learn_unknown(patterns, diags)
         history.setdefault("entries",[]).append({"handled_at":utc(),"repo":REPO,"workflow":run.get("name"),"run_id":rid,"run_attempt":attempt,"commit_sha":run.get("head_sha"),"branch":run.get("head_branch"),"classification":cat,"action":action,"issue_number":number,"run_url":run.get("html_url"),"diagnostics":diags,"outcome":outcome})
         processed += 1
     counts: dict[tuple[str,str],int] = {}
@@ -176,8 +200,8 @@ def main() -> int:
     known = {(x.get("workflow"),x.get("job")) for x in flaky.get("tests",[])}
     for (w,j),n in counts.items():
         if n >= 2 and (w,j) not in known: flaky.setdefault("tests",[]).append({"workflow":w,"job":j,"observed_failures":n,"first_flagged_at":utc(),"status":"candidate"})
-    save("run-history.json",history); save("flaky-tests.json",flaky)
-    out("needs_workflow_doctor","true" if doctor else "false"); out("processed",str(processed))
+    save("error-patterns.json",patterns); save("run-history.json",history); save("flaky-tests.json",flaky)
+    out("needs_workflow_doctor","true" if doctor else "false"); out("processed",str(processed)); out("learned_patterns",str(learned))
     return 0
 
 if __name__ == "__main__":
