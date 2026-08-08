@@ -1,0 +1,119 @@
+name: Reusable Auto Heal
+
+on:
+  workflow_call:
+    inputs:
+      run_id:
+        description: Optional failed workflow run ID to process immediately.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  heal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout caller default branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${DEFAULT_BRANCH}"
+          git checkout -B "${DEFAULT_BRANCH}" FETCH_HEAD
+
+      - name: Bootstrap pinned ClearGlass auto-heal engine
+        shell: bash
+        env:
+          ENGINE_SHA: a57ce61fbb16086c8ab9dc03e59c099e94ba65ac
+        run: |
+          set -euo pipefail
+          mkdir -p .github/auto-heal
+          base="https://raw.githubusercontent.com/ClearGlasslabs/workflow-artifacts/${ENGINE_SHA}/auto-heal"
+          for file in README.md auto_heal.py error-patterns.json healing-strategies.json; do
+            if [[ ! -f ".github/auto-heal/${file}" ]]; then
+              curl --fail --silent --show-error --location \
+                "${base}/${file}" \
+                --output ".github/auto-heal/${file}"
+            fi
+          done
+          [[ -f .github/auto-heal/run-history.json ]] || printf '{\n  "schema_version": 1,\n  "entries": []\n}\n' > .github/auto-heal/run-history.json
+          [[ -f .github/auto-heal/flaky-tests.json ]] || printf '{\n  "schema_version": 1,\n  "tests": []\n}\n' > .github/auto-heal/flaky-tests.json
+
+      - name: Analyze and heal failures
+        id: heal
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          AUTO_HEAL_RUN_ID: ${{ inputs.run_id }}
+          AUTO_HEAL_WORKFLOW_NAME: Auto Heal
+        run: python .github/auto-heal/auto_heal.py
+
+      - name: Apply deterministic repository workflow doctor repairs
+        if: steps.heal.outputs.needs_workflow_doctor == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f scripts/workflow_doctor.py ]]; then
+            python -m pip install --disable-pip-version-check "PyYAML==6.0.2"
+            python scripts/workflow_doctor.py --fix
+          else
+            echo "No repository workflow doctor is installed; escalating through diagnostics only."
+          fi
+
+      - name: Create review branch for generated changes
+        id: changes
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SOURCE_RUN: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$(git status --porcelain .github/auto-heal .github/workflows)" ]]; then
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          source="${SOURCE_RUN:-scan}"
+          BRANCH="auto-heal/${source}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git config user.name "ClearGlass Auto Heal"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BRANCH}"
+          git add .github/auto-heal .github/workflows
+          git commit -m "Auto-heal: record diagnostics and governed repairs"
+          git push --set-upstream origin "${BRANCH}"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Open auto-heal pull request
+        if: steps.changes.outputs.branch != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ steps.changes.outputs.branch }}
+          SOURCE_RUN: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          source_url="scheduled/repository scan"
+          if [[ -n "${SOURCE_RUN}" ]]; then
+            source_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}"
+          fi
+          gh pr create \
+            --base "${DEFAULT_BRANCH}" \
+            --head "${BRANCH}" \
+            --title "Auto-heal: governed GitHub Actions repair" \
+            --body "Automated, review-gated self-healing update.
+
+          Source: ${source_url}
+
+          This PR contains only local auto-heal state and deterministic repository workflow repairs permitted by policy. No secrets are changed, no protected branch is force-pushed, security checks are not weakened, and auto-merge is disabled."
