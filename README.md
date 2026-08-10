@@ -1,3 +1,11 @@
+<!-- CLEARGLASS-BRAND:START -->
+<p align="center">
+  <a href="https://www.clearglassinc.com/">
+    <img src="https://raw.githubusercontent.com/ClearGlasslabs/ClearGlassInc./brand-assets/clearglass-seal.jpg" alt="ClearGlass Inc." width="360" />
+  </a>
+</p>
+<!-- CLEARGLASS-BRAND:END -->
+
 # Work with Workflow Artifacts
 
 _Learn how to upload, preview, download, and reuse workflow artifacts in GitHub Actions._
